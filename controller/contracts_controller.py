@@ -13,12 +13,11 @@ class ContractsController:
         self.browser = browser
         self.page = browser.page
 
-        self.csv_path = (
-            Path(__file__).resolve().parents[1]
-            / "data"
-            / "Datasets"
-            / "categories.csv"
-        )
+        base_path = Path(__file__).resolve().parents[1]
+
+        self.csv_path = base_path / "data" / "Datasets" / "categories.csv"
+        self.scrap_dir = base_path / "data" / "scrapped"
+        self.scrap_dir.mkdir(parents=True, exist_ok=True)
 
         self.csv_rows = []
         self.csv_category_set = set()
@@ -114,56 +113,25 @@ class ContractsController:
         self.page.wait_for_timeout(1000)
 
     def solve_and_submit_captcha(self, max_attempts=10):
-        attempt = 1
-
-        while attempt <= max_attempts:
-            print(f"[CAPTCHA] Attempt {attempt}/{max_attempts}")
-
+        for _ in range(max_attempts):
             img = self._get_captcha_image()
             text, confidence = ensemble_solve(img)
 
-            print(f"[OCR] '{text}' | confidence={confidence:.2f}")
-
             if not text or confidence < 0.55:
                 self._refresh_captcha()
-                attempt += 1
                 continue
 
             self.page.fill("#captcha_code1", text)
             self.page.click("#searchlocation1")
+            self.page.wait_for_timeout(3000)
+            return True
 
-            try:
-                self.page.wait_for_selector(
-                    "div[style*='color:red'], table, #loader",
-                    timeout=15000
-                )
-
-                if self.page.locator("#loader").count() > 0:
-                    self.page.wait_for_selector("#loader", state="hidden", timeout=15000)
-
-                print("[CAPTCHA] ✅ Search completed")
-                return True
-
-            except Exception:
-                self._refresh_captcha()
-                attempt += 1
-
-        print("[CAPTCHA] ❌ Failed after max attempts")
         return False
 
     # --------------------------------------------------
-    # CATEGORY PROCESS (EXACT MATCH SELECTION)
+    # CATEGORY PROCESS
     # --------------------------------------------------
     def process_category(self, category_name):
-        """
-        1. Type CSV category
-        2. Collect suggestions
-        3. Append new suggestions to CSV (END only)
-        4. Click suggestion that EXACTLY matches typed category
-        """
-        print(f"[CATEGORY] Processing: {category_name}")
-
-        # Open dropdown
         self.page.click(".select2-selection")
         self.page.wait_for_selector("input.select2-search__field")
 
@@ -176,72 +144,128 @@ class ContractsController:
             "li.select2-results__option:not(.select2-results__message)"
         )
 
-        total = suggestions.count()
-        print(f"[SUGGESTIONS] Found {total}")
-
         new_suggestions = []
         exact_match = None
         csv_lc = category_name.lower()
 
-        for i in range(total):
+        for i in range(suggestions.count()):
             text = suggestions.nth(i).inner_text().strip()
             if not text:
                 continue
 
-            text_lc = text.lower()
-
-            # Queue new categories
-            if text_lc not in self.csv_category_set:
+            if text.lower() not in self.csv_category_set:
                 new_suggestions.append(text)
 
-            # Find exact match
-            if text_lc == csv_lc:
+            if text.lower() == csv_lc:
                 exact_match = suggestions.nth(i)
 
-        # Append suggestions (queue only)
         self._append_multiple_categories(new_suggestions)
 
-        # Click exact match only
         if exact_match:
             exact_match.click()
             self.page.wait_for_timeout(1000)
-            print(f"[CATEGORY] ✅ Selected exact match: {category_name}")
         else:
-            raise Exception(
-                f"Exact match not found in dropdown for category: {category_name}"
-            )
+            raise Exception(f"Exact match not found: {category_name}")
 
     # --------------------------------------------------
-    # RESULT CHECK
+    # SCRAPING LOGIC (FINAL – ALL FIELDS)
     # --------------------------------------------------
-    def has_no_result(self):
-        locator = self.page.locator("div[style*='color:red']")
-        if locator.count() > 0:
-            return "No Result Found" in locator.first.inner_text()
-        return False
+    def scrape_results(self):
+        self.page.wait_for_selector("span.ajxtag_order_number", timeout=15000)
+
+        bid_nodes = self.page.locator("span.ajxtag_order_number")
+        item_nodes = self.page.locator("span.ajxtag_item_title")
+        qty_nodes = self.page.locator("span.ajxtag_quantity")
+        value_nodes = self.page.locator("span.ajxtag_totalvalue")
+        buyer_org_nodes = self.page.locator("span.ajxtag_buyer_dept_org")
+        mode_nodes = self.page.locator("span.ajxtag_buying_mode")
+        date_nodes = self.page.locator("span.ajxtag_contract_date")
+        status_nodes = self.page.locator("span.ajxtag_order_status")
+
+        row_count = bid_nodes.count()
+        print(f"[SCRAPE] Rows detected: {row_count}")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = self.scrap_dir / f"bids_{timestamp}.csv"
+
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "serial_no",
+                "bid_no",
+                "product",
+                "brand",
+                "model",
+                "ordered_quantity",
+                "price",
+                "total_value",
+                "Organization Type",
+                "organization_name",
+                "buyer_designation",
+                "Ministry",
+                "Department",
+                "office_zone",
+                "buying_mode",
+                "contract_date",
+                "order_status"
+            ])
+
+            for i in range(row_count):
+                writer.writerow([
+                    i + 1,
+                    bid_nodes.nth(i).inner_text().strip(),
+
+                    # product / brand / model (3 per row)
+                    item_nodes.nth(i * 3).inner_text().strip() if (i * 3) < item_nodes.count() else "N/A",
+                    item_nodes.nth(i * 3 + 1).inner_text().strip() if (i * 3 + 1) < item_nodes.count() else "N/A",
+                    item_nodes.nth(i * 3 + 2).inner_text().strip() if (i * 3 + 2) < item_nodes.count() else "N/A",
+
+                    # ordered quantity
+                    qty_nodes.nth(i).inner_text().strip() if i < qty_nodes.count() else "N/A",
+
+                    # price & total value (2 per row)
+                    value_nodes.nth(i * 2 + 1).inner_text().strip() if (i * 2 + 1) < value_nodes.count() else "N/A",
+                    value_nodes.nth(i * 2).inner_text().strip() if (i * 2) < value_nodes.count() else "N/A",
+
+                    # ajxtag_buyer_dept_org (3 per row)
+                    buyer_org_nodes.nth(i * 3).inner_text().strip() if (i * 3) < buyer_org_nodes.count() else "N/A",
+                    buyer_org_nodes.nth(i * 3 + 1).inner_text().strip() if (i * 3 + 1) < buyer_org_nodes.count() else "N/A",
+                    buyer_org_nodes.nth(i * 3 + 2).inner_text().strip() if (i * 3 + 2) < buyer_org_nodes.count() else "N/A",
+
+                    # ajxtag_buying_mode (4 per row)
+                    mode_nodes.nth(i * 4).inner_text().strip() if (i * 4) < mode_nodes.count() else "N/A",
+                    mode_nodes.nth(i * 4 + 1).inner_text().strip() if (i * 4 + 1) < mode_nodes.count() else "N/A",
+                    mode_nodes.nth(i * 4 + 2).inner_text().strip() if (i * 4 + 2) < mode_nodes.count() else "N/A",
+                    mode_nodes.nth(i * 4 + 3).inner_text().strip() if (i * 4 + 3) < mode_nodes.count() else "N/A",
+
+                    # contract date
+                    date_nodes.nth(i).inner_text().strip() if i < date_nodes.count() else "N/A",
+
+                    # order status
+                    status_nodes.nth(i).inner_text().strip() if i < status_nodes.count() else "N/A"
+                ])
+
+        print(f"[SCRAPE] ✅ Saved to {output_file}")
 
     # --------------------------------------------------
-    # MAIN LOOP (STRICT CSV QUEUE)
+    # MAIN LOOP
     # --------------------------------------------------
     def run(self):
         index = 0
 
         while index < len(self.csv_rows):
-            row = self.csv_rows[index]
-            print(f"\n[CSV] si_no={row['si_no']} | category={row['category_name']}")
-
-            self.process_category(row["category_name"])
+            self.process_category(self.csv_rows[index]["category_name"])
             self.set_date_filter()
 
             if not self.solve_and_submit_captcha():
                 self.go_to_gem_contracts()
                 continue
 
-            if self.has_no_result():
-                print("[RESULT] ❌ No Result → next CSV row")
+            if self.page.locator("div[style*='color:red']").count() > 0:
                 self.go_to_gem_contracts()
                 index += 1
                 continue
 
-            print("[RESULT] ✅ Data found → STOP HERE")
+            print("[RESULT] ✅ Data found → SCRAPING")
+            self.scrape_results()
             break
