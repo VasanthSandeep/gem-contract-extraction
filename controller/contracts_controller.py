@@ -1,7 +1,6 @@
 import csv
 import base64
 import io
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from PIL import Image
@@ -42,11 +41,9 @@ class ContractsController:
                 })
                 self.csv_category_set.add(name.lower())
 
+        print(f"[CSV] Loaded {len(self.csv_rows)} categories")
+
     def _append_multiple_categories(self, new_categories):
-        """
-        Append suggested categories ONLY at END of CSV.
-        Do NOT affect current processing order.
-        """
         if not new_categories:
             return
 
@@ -67,7 +64,7 @@ class ContractsController:
                 })
                 self.csv_category_set.add(key)
 
-                print(f"[CSV] ➕ Appended to end: {cat}")
+                print(f"[CSV] ➕ Appended (queued later): {cat}")
 
     # --------------------------------------------------
     # NAVIGATION
@@ -148,7 +145,6 @@ class ContractsController:
                 return True
 
             except Exception:
-                print("[CAPTCHA] ⚠️ Page stuck, retrying...")
                 self._refresh_captcha()
                 attempt += 1
 
@@ -156,17 +152,18 @@ class ContractsController:
         return False
 
     # --------------------------------------------------
-    # CATEGORY PROCESS (UPDATED LOGIC)
+    # CATEGORY PROCESS (EXACT MATCH SELECTION)
     # --------------------------------------------------
     def process_category(self, category_name):
         """
-        1. Type ONLY CSV category
-        2. Collect website suggestions
-        3. Append suggestions to END of CSV
-        4. Select ONLY CSV category
+        1. Type CSV category
+        2. Collect suggestions
+        3. Append new suggestions to CSV (END only)
+        4. Click suggestion that EXACTLY matches typed category
         """
-        print(f"[CATEGORY] Using CSV category: {category_name}")
+        print(f"[CATEGORY] Processing: {category_name}")
 
+        # Open dropdown
         self.page.click(".select2-selection")
         self.page.wait_for_selector("input.select2-search__field")
 
@@ -179,39 +176,52 @@ class ContractsController:
             "li.select2-results__option:not(.select2-results__message)"
         )
 
+        total = suggestions.count()
+        print(f"[SUGGESTIONS] Found {total}")
+
         new_suggestions = []
-        count = suggestions.count()
-        print(f"[SUGGESTIONS] Found {count}")
+        exact_match = None
+        csv_lc = category_name.lower()
 
-        for i in range(count):
+        for i in range(total):
             text = suggestions.nth(i).inner_text().strip()
-            if text and text.lower() not in self.csv_category_set:
-                new_suggestions.append(text)
-                print(f"[SUGGESTIONS] New → {text}")
+            if not text:
+                continue
 
-        # ✅ APPEND ONLY (DO NOT PROCESS NOW)
+            text_lc = text.lower()
+
+            # Queue new categories
+            if text_lc not in self.csv_category_set:
+                new_suggestions.append(text)
+
+            # Find exact match
+            if text_lc == csv_lc:
+                exact_match = suggestions.nth(i)
+
+        # Append suggestions (queue only)
         self._append_multiple_categories(new_suggestions)
 
-        # ✅ SELECT ONLY CSV CATEGORY
-        search.press("Enter")
-        self.page.wait_for_timeout(1000)
-        print("[CATEGORY] ✅ CSV category selected")
+        # Click exact match only
+        if exact_match:
+            exact_match.click()
+            self.page.wait_for_timeout(1000)
+            print(f"[CATEGORY] ✅ Selected exact match: {category_name}")
+        else:
+            raise Exception(
+                f"Exact match not found in dropdown for category: {category_name}"
+            )
 
     # --------------------------------------------------
     # RESULT CHECK
     # --------------------------------------------------
     def has_no_result(self):
-        try:
-            locator = self.page.locator("div[style*='color:red']")
-            if locator.count() > 0:
-                text = locator.first.inner_text()
-                return "No Result Found" in text
-        except:
-            pass
+        locator = self.page.locator("div[style*='color:red']")
+        if locator.count() > 0:
+            return "No Result Found" in locator.first.inner_text()
         return False
 
     # --------------------------------------------------
-    # MAIN LOOP (QUEUE BEHAVIOR)
+    # MAIN LOOP (STRICT CSV QUEUE)
     # --------------------------------------------------
     def run(self):
         index = 0
@@ -223,17 +233,15 @@ class ContractsController:
             self.process_category(row["category_name"])
             self.set_date_filter()
 
-            captcha_ok = self.solve_and_submit_captcha()
-            if not captcha_ok:
-                print("[RESET] Reloading page & retrying same category")
+            if not self.solve_and_submit_captcha():
                 self.go_to_gem_contracts()
                 continue
 
             if self.has_no_result():
-                print("[RESULT] ❌ No Result Found → next category")
+                print("[RESULT] ❌ No Result → next CSV row")
                 self.go_to_gem_contracts()
                 index += 1
                 continue
 
-            print("[RESULT] ✅ Data found → ready for scraping")
+            print("[RESULT] ✅ Data found → STOP HERE")
             break
