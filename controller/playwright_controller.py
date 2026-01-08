@@ -1,5 +1,3 @@
-# controller/contracts_controller.py
-
 import csv
 import base64
 import io

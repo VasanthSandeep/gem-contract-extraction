@@ -1,5 +1,3 @@
-# controller/contracts_controller.py
-
 import csv
 import base64
 import io
@@ -23,15 +21,17 @@ class ContractsController:
             / "categories.csv"
         )
 
-        # Load CSV once
         self.csv_rows = []
         self.csv_category_set = set()
         self._load_csv()
 
     # --------------------------------------------------
-    # CSV HANDLING (WINDOWS SAFE)
+    # CSV HANDLING
     # --------------------------------------------------
     def _load_csv(self):
+        self.csv_rows.clear()
+        self.csv_category_set.clear()
+
         with open(self.csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -40,56 +40,34 @@ class ContractsController:
                     "si_no": int(row["si_no"]),
                     "category_name": name
                 })
-                self.csv_category_set.add(name)
+                self.csv_category_set.add(name.lower())
 
     def _append_multiple_categories(self, new_categories):
+        """
+        Append suggested categories ONLY at END of CSV.
+        Do NOT affect current processing order.
+        """
         if not new_categories:
             return
 
-        # Retry logic for file writing (in case file is locked)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
 
-                    for cat in new_categories:
-                        if cat not in self.csv_category_set:
-                            si_no = len(self.csv_rows) + 1
-                            writer.writerow([si_no, cat])
-                            self.csv_rows.append({
-                                "si_no": si_no,
-                                "category_name": cat
-                            })
-                            self.csv_category_set.add(cat)
-                            print(f"[CSV] Added new category: {cat}")
-                
-                print(f"[CSV] Total categories in queue: {len(self.csv_rows)}")
-                break  # Success, exit retry loop
-                
-            except PermissionError as e:
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
-                    print(f"[CSV] File is locked, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    print(f"[CSV] ❌ ERROR: Could not write to CSV after {max_retries} attempts")
-                    print(f"[CSV] Please close the CSV file in any editor and press Enter to continue...")
-                    input()
-                    # Try one more time after user confirmation
-                    with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        for cat in new_categories:
-                            if cat not in self.csv_category_set:
-                                si_no = len(self.csv_rows) + 1
-                                writer.writerow([si_no, cat])
-                                self.csv_rows.append({
-                                    "si_no": si_no,
-                                    "category_name": cat
-                                })
-                                self.csv_category_set.add(cat)
-                                print(f"[CSV] Added new category: {cat}")
-                    print(f"[CSV] Total categories in queue: {len(self.csv_rows)}")
+            for cat in new_categories:
+                key = cat.lower()
+                if key in self.csv_category_set:
+                    continue
+
+                si_no = len(self.csv_rows) + 1
+                writer.writerow([si_no, cat])
+
+                self.csv_rows.append({
+                    "si_no": si_no,
+                    "category_name": cat
+                })
+                self.csv_category_set.add(key)
+
+                print(f"[CSV] ➕ Appended to end: {cat}")
 
     # --------------------------------------------------
     # NAVIGATION
@@ -100,7 +78,7 @@ class ContractsController:
         self.page.wait_for_timeout(1000)
         self.page.click('ul#nav a[href="https://gem.gov.in/view_contracts"]')
         self.page.wait_for_timeout(2000)
-        print("[SUCCESS] Reached GeM Contracts page")
+        print("[NAV] Reached GeM Contracts page")
 
     # --------------------------------------------------
     # DATE FILTER
@@ -138,15 +116,16 @@ class ContractsController:
         self.page.click("#captchaimg1")
         self.page.wait_for_timeout(1000)
 
-    def solve_and_submit_captcha(self):
+    def solve_and_submit_captcha(self, max_attempts=10):
         attempt = 1
 
-        while True:
-            print(f"[CAPTCHA] Attempt {attempt}")
+        while attempt <= max_attempts:
+            print(f"[CAPTCHA] Attempt {attempt}/{max_attempts}")
+
             img = self._get_captcha_image()
             text, confidence = ensemble_solve(img)
 
-            print(f"[OCR] '{text}' | confidence={confidence}")
+            print(f"[OCR] '{text}' | confidence={confidence:.2f}")
 
             if not text or confidence < 0.55:
                 self._refresh_captcha()
@@ -155,64 +134,103 @@ class ContractsController:
 
             self.page.fill("#captcha_code1", text)
             self.page.click("#searchlocation1")
-            self.page.wait_for_timeout(2500)
-            return
+
+            try:
+                self.page.wait_for_selector(
+                    "div[style*='color:red'], table, #loader",
+                    timeout=15000
+                )
+
+                if self.page.locator("#loader").count() > 0:
+                    self.page.wait_for_selector("#loader", state="hidden", timeout=15000)
+
+                print("[CAPTCHA] ✅ Search completed")
+                return True
+
+            except Exception:
+                print("[CAPTCHA] ⚠️ Page stuck, retrying...")
+                self._refresh_captcha()
+                attempt += 1
+
+        print("[CAPTCHA] ❌ Failed after max attempts")
+        return False
 
     # --------------------------------------------------
-    # CATEGORY PROCESS
+    # CATEGORY PROCESS (UPDATED LOGIC)
     # --------------------------------------------------
     def process_category(self, category_name):
+        """
+        1. Type ONLY CSV category
+        2. Collect website suggestions
+        3. Append suggestions to END of CSV
+        4. Select ONLY CSV category
+        """
         print(f"[CATEGORY] Using CSV category: {category_name}")
 
         self.page.click(".select2-selection")
         self.page.wait_for_selector("input.select2-search__field")
 
         search = self.page.locator("input.select2-search__field")
+        search.clear()
         search.fill(category_name)
         self.page.wait_for_timeout(1500)
 
-        # Collect suggestions
-        new_suggestions = set()
         suggestions = self.page.locator(
             "li.select2-results__option:not(.select2-results__message)"
         )
 
-        total_suggestions = suggestions.count()
-        print(f"[SUGGESTIONS] Found {total_suggestions} suggestions from website")
+        new_suggestions = []
+        count = suggestions.count()
+        print(f"[SUGGESTIONS] Found {count}")
 
-        for i in range(total_suggestions):
+        for i in range(count):
             text = suggestions.nth(i).inner_text().strip()
-            if text and text not in self.csv_category_set:
-                new_suggestions.add(text)
+            if text and text.lower() not in self.csv_category_set:
+                new_suggestions.append(text)
+                print(f"[SUGGESTIONS] New → {text}")
 
-        # Append safely ONCE
-        if new_suggestions:
-            print(f"[SUGGESTIONS] Saving {len(new_suggestions)} new categories to CSV...")
-            self._append_multiple_categories(new_suggestions)
-        else:
-            print("[SUGGESTIONS] No new categories to save (all already in CSV)")
+        # ✅ APPEND ONLY (DO NOT PROCESS NOW)
+        self._append_multiple_categories(new_suggestions)
 
-        # Select ONLY CSV category
+        # ✅ SELECT ONLY CSV CATEGORY
         search.press("Enter")
-        print("[CATEGORY] CSV category selected")
+        self.page.wait_for_timeout(1000)
+        print("[CATEGORY] ✅ CSV category selected")
 
     # --------------------------------------------------
-    # MAIN LOOP
+    # RESULT CHECK
+    # --------------------------------------------------
+    def has_no_result(self):
+        try:
+            locator = self.page.locator("div[style*='color:red']")
+            if locator.count() > 0:
+                text = locator.first.inner_text()
+                return "No Result Found" in text
+        except:
+            pass
+        return False
+
+    # --------------------------------------------------
+    # MAIN LOOP (QUEUE BEHAVIOR)
     # --------------------------------------------------
     def run(self):
         index = 0
+
         while index < len(self.csv_rows):
             row = self.csv_rows[index]
             print(f"\n[CSV] si_no={row['si_no']} | category={row['category_name']}")
 
             self.process_category(row["category_name"])
             self.set_date_filter()
-            self.solve_and_submit_captcha()
 
-            if self.page.locator("text=No Result Found").count() > 0:
-                print("[RESULT] ❌ No Result Found → moving to next si_no")
-                # Reset page state for next category
-                print("[RESET] Reloading contracts page for next category...")
+            captcha_ok = self.solve_and_submit_captcha()
+            if not captcha_ok:
+                print("[RESET] Reloading page & retrying same category")
+                self.go_to_gem_contracts()
+                continue
+
+            if self.has_no_result():
+                print("[RESULT] ❌ No Result Found → next category")
                 self.go_to_gem_contracts()
                 index += 1
                 continue
